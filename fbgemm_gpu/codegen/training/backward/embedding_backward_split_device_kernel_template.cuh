@@ -69,6 +69,136 @@ template <
     int32_t kFixedMaxVecsPerThread,
     int32_t kThreadGroupSize = kWarpSize,
     int32_t VEC_WIDTH,
+    int32_t unrollCount
+>
+DEVICE_INLINE void compute_grad_sum_{{ kdesc }}_unroll(
+    Vec4TAcc<cache_t>* grad_sum,
+    const pta::PackedTensorAccessor64<grad_t, {{ "1" if is_index_select else "2" }}, at::RestrictPtrTraits>& grad_output,
+    {%- if not nobag or is_index_select %}
+    const pta::PackedTensorAccessor32<int32_t, 1, at::RestrictPtrTraits>& D_offsets,
+    {%- endif %}
+    const int32_t D,
+    const int32_t T,
+    const pta::PackedTensorAccessor32<{{ "int64_t" if nobag else "int32_t" }}, 1, at::RestrictPtrTraits>& sorted_infos,
+    {%- if weighted %}
+    const pta::PackedTensorAccessor32<at::acc_type<cache_t, true>, 1, at::RestrictPtrTraits>& sorted_indice_weights,
+    {%- endif %}
+    {%- if not nobag and vbe %}
+    const pta::PackedTensorAccessor32<int32_t, 1, at::RestrictPtrTraits>& B_offsets,
+    const pta::PackedTensorAccessor32<int64_t, 1, at::RestrictPtrTraits>& row_output_offsets,
+    {%- endif %}
+    {%- if is_index_select %}
+    const int64_t grad_offset,
+    const int32_t grad_stride,
+    {%- endif %}
+    {%- if not nobag %}
+    const int32_t info_B_num_bits,
+    const uint32_t info_B_mask,
+    {%- endif %}
+    const int32_t segment_start,
+    const int32_t sl_start,
+    const int32_t sl_end,
+    const unsigned int shfl_sync_mask,
+    const int32_t vec_start
+) {
+    for (int32_t sl = sl_start; sl < sl_end; sl += kThreadGroupSize) {
+            auto sl_j = sl + threadIdx.x;
+            {%- if not nobag %}
+            const auto b_t = sl_j < sl_end
+                ? reinterpret_cast<const uint32_t*>(
+                    &sorted_infos[0])[segment_start + sl_j]
+                : 0;
+            const auto b = b_t & info_B_mask;
+            const auto t = b_t >> info_B_num_bits;
+            {%- if vbe %}
+            const auto grad_offset = row_output_offsets[B_offsets[t] + b];
+            {%- else %} // if vbe
+            int32_t D_start = sl_j < sl_end ? D_offsets[t] : 0;
+            {%- endif %} // if vbe
+            {%- else %} // if not nobag
+            int64_t l_t = sl_j < sl_end ? sorted_infos[segment_start + sl_j] : 0;
+            int32_t l = l_t / T;
+            {%- endif %} // if not nobag
+            {%- if weighted %}
+            at::acc_type<cache_t, true> idx_weight = sl_j < sl_end
+                ? sorted_indice_weights[segment_start + sl_j]
+                : 0.0;
+            {%- endif %}
+            for (int32_t j = 0; j < kThreadGroupSize/unrollCount && sl+unrollCount*j<sl_end ; ++j) {
+
+                {%- if nobag %}
+                int32_t ls[unrollCount];
+                {%- elif vbe %}
+                int32_t grad_offsets[unrollCount];
+                {%- else %}
+                int32_t b_ids[unrollCount];
+                int32_t D_startIds[unrollCount];
+                {%- endif %}
+
+                {%- if weighted %}
+                at::acc_type<cache_t, true> idx_weight_ids[unrollCount];
+                {%- endif %}
+
+                #pragma unroll unrollCount
+                for (int32_t i = 0; i < unrollCount; ++i) {
+                    int32_t id = unrollCount*j+i;
+                
+                    {%- if nobag %}
+                    int32_t l_id = SHFL_SYNC(l, id);
+                    ls[i]=l_id;
+                    {%- elif vbe %}
+                    const auto grad_offset_id = SHFL_SYNC(grad_offset, id);
+                    grad_offsets[i] = grad_offset_id;
+                    {%- else %}
+                    int32_t b_id = SHFL_SYNC(b, id);
+                    int32_t D_start_id = SHFL_SYNC(D_start, id);
+                    b_ids[i]=b_id;
+                    D_startIds[i]=D_start_id;
+                    {%- endif %}
+
+                    {%- if weighted %}
+                    at::acc_type<cache_t, true> idx_weight_id = SHFL_SYNC(idx_weight, id);
+                    idx_weight_ids[i]=idx_weight_id;
+                    {%- endif %}
+                }
+                
+
+                {%- set d = "(((vec + vec_start) * kThreadGroupSize + threadIdx.x) * VEC_WIDTH)" %}
+
+                for (int32_t vec = 0; vec < kFixedMaxVecsPerThread && {{ d }} < D; ++vec) {
+                    const int32_t d = {{ d }};
+                    for (int32_t i = 0; i < unrollCount; ++i) {
+                        int32_t id = unrollCount*j+i;
+                        Vec4TAcc<grad_t> grad_out_vec(
+                            {%- if nobag and is_index_select %}
+                            // grad_output is 1d
+                            &grad_output[grad_offset + ls[i] * grad_stride + d]
+                            {%- elif nobag %}
+                            &grad_output[ls[i]][d]
+                            {%- elif vbe %}
+                            &grad_output[0][grad_offsets[i] + d]
+                            {%- else %}
+                            &grad_output[b_ids[i]][0] + D_startIds[i] + d
+                            {%- endif %} // if nobag
+                        );
+
+                        {%- if weighted %}
+                        grad_sum[vec].fma_(grad_out_vec, idx_weight_ids[i]);
+                        {%- else %}
+                        grad_sum[vec].add_(grad_out_vec);
+                        {%- endif %}
+                    }
+                }
+            }
+        }
+    }
+
+template <
+    typename grad_t,
+    typename cache_t,
+    int32_t kFixedMaxVecsPerThread,
+    int32_t kThreadGroupSize = kWarpSize,
+    int32_t VEC_WIDTH,
     bool kUseVecBlocking
 >
 DEVICE_INLINE void compute_grad_sum_{{ kdesc }}(
@@ -118,69 +248,126 @@ DEVICE_INLINE void compute_grad_sum_{{ kdesc }}(
             grad_sum[vec].acc.w = 0;
         }
 
-        for (int32_t sl = sl_start; sl < sl_end; sl += kThreadGroupSize) {
-            auto sl_j = sl + threadIdx.x;
-            {%- if not nobag %}
-            const auto b_t = sl_j < sl_end
-                ? reinterpret_cast<const uint32_t*>(
-                    &sorted_infos[0])[segment_start + sl_j]
-                : 0;
-            const auto b = b_t & info_B_mask;
-            const auto t = b_t >> info_B_num_bits;
-            {%- if vbe %}
-            const auto grad_offset = row_output_offsets[B_offsets[t] + b];
-            {%- else %} // if vbe
-            int32_t D_start = sl_j < sl_end ? D_offsets[t] : 0;
-            {%- endif %} // if vbe
-            {%- else %} // if not nobag
-            int64_t l_t = sl_j < sl_end ? sorted_infos[segment_start + sl_j] : 0;
-            int32_t l = l_t / T;
-            {%- endif %} // if not nobag
-            {%- if weighted %}
-            at::acc_type<cache_t, true> idx_weight = sl_j < sl_end
-                ? sorted_indice_weights[segment_start + sl_j]
-                : 0.0;
-            {%- endif %}
-            for (int32_t j = 0; j < kThreadGroupSize && sl + j < sl_end; ++j) {
-                {%- if nobag %}
-                int32_t l_j = SHFL_SYNC(l, j);
-                {%- elif vbe %}
-                const auto grad_offset_j = SHFL_SYNC(grad_offset, j);
-                {%- else %}
-                int32_t b_j = SHFL_SYNC(b, j);
-                int32_t D_start_j = SHFL_SYNC(D_start, j);
-                {%- endif %}
-
-                {%- if weighted %}
-                at::acc_type<cache_t, true> idx_weight_j = SHFL_SYNC(idx_weight, j);
-                {%- endif %}
-
-                {%- set d = "(((vec + vec_start) * kThreadGroupSize + threadIdx.x) * VEC_WIDTH)" %}
-
-                #pragma unroll kFixedMaxVecsPerThread
-                for (int32_t vec = 0; vec < kFixedMaxVecsPerThread && {{ d }} < D; ++vec) {
-                    const int32_t d = {{ d }};
-                    Vec4TAcc<grad_t> grad_out_vec(
-                        {%- if nobag and is_index_select %}
-                        // grad_output is 1d
-                        &grad_output[grad_offset + l_j * grad_stride + d]
-                        {%- elif nobag %}
-                        &grad_output[l_j][d]
-                        {%- elif vbe %}
-                        &grad_output[0][grad_offset_j + d]
-                        {%- else %}
-                        &grad_output[b_j][0] + D_start_j + d
-                        {%- endif %} // if nobag
-                    );
-
-                    {%- if weighted %}
-                    grad_sum[vec].fma_(grad_out_vec, idx_weight_j);
-                    {%- else %}
-                    grad_sum[vec].add_(grad_out_vec);
-                    {%- endif %}
-                }
-            }
+        int32_t sl_length = sl_end - sl_start;
+        const int32_t unroll_factors[] = {8, 4, 2};
+        const size_t num_factors = sizeof(unroll_factors) / sizeof(unroll_factors[0]);
+        int32_t start[num_factors], end[num_factors];
+        // Calculate start and end indices
+        int32_t prev_end = sl_start;
+        for (int i = 0; i < num_factors; ++i) {
+            start[i] = prev_end;
+            end[i] = sl_end - sl_length % unroll_factors[i];
+            prev_end = end[i];
         }
+
+        // Lambda for unroll call
+        auto call_unroll = [&](int unroll, int sl_start, int sl_end) {
+            switch (unroll) {
+                case 8:
+                    compute_grad_sum_{{ kdesc }}_unroll<grad_t,cache_t,kFixedMaxVecsPerThread,kThreadGroupSize,VEC_WIDTH,8>(
+                        grad_sum, grad_output, 
+                        {%- if not nobag or is_index_select %}
+                        D_offsets,
+                        {%- endif %}
+                        D, T, sorted_infos,
+                        {%- if weighted %}
+                        sorted_indice_weights,
+                        {%- endif %}
+                        {%- if not nobag and vbe %}
+                        B_offsets,
+                        row_output_offsets,
+                        {%- endif %}
+                        {%- if is_index_select %}
+                        grad_offset,
+                        grad_stride,
+                        {%- endif %}
+                        {%- if not nobag %} 
+                        info_B_num_bits, info_B_mask,
+                        {%- endif %}
+                        segment_start, sl_start, sl_end, shfl_sync_mask, vec_start
+                    );
+                    break;
+                case 4:
+                    compute_grad_sum_{{ kdesc }}_unroll<grad_t,cache_t,kFixedMaxVecsPerThread,kThreadGroupSize,VEC_WIDTH,4>(
+                        grad_sum, grad_output, 
+                        {%- if not nobag or is_index_select %}
+                        D_offsets,
+                        {%- endif %}
+                        D, T, sorted_infos,
+                        {%- if weighted %}
+                        sorted_indice_weights,
+                        {%- endif %}
+                        {%- if not nobag and vbe %}
+                        B_offsets,
+                        row_output_offsets,
+                        {%- endif %}
+                        {%- if is_index_select %}
+                        grad_offset,
+                        grad_stride,
+                        {%- endif %}
+                        {%- if not nobag %} 
+                        info_B_num_bits, info_B_mask,
+                        {%- endif %}
+                        segment_start, sl_start, sl_end, shfl_sync_mask, vec_start
+                    );
+                    break;
+                case 2:
+                    compute_grad_sum_{{ kdesc }}_unroll<grad_t,cache_t,kFixedMaxVecsPerThread,kThreadGroupSize,VEC_WIDTH,2>(
+                        grad_sum, grad_output, 
+                        {%- if not nobag or is_index_select %}
+                        D_offsets,
+                        {%- endif %}
+                        D, T, sorted_infos,
+                        {%- if weighted %}
+                        sorted_indice_weights,
+                        {%- endif %}
+                        {%- if not nobag and vbe %}
+                        B_offsets,
+                        row_output_offsets,
+                        {%- endif %}
+                        {%- if is_index_select %}
+                        grad_offset,
+                        grad_stride,
+                        {%- endif %}
+                        {%- if not nobag %} 
+                        info_B_num_bits, info_B_mask,
+                        {%- endif %}
+                        segment_start, sl_start, sl_end, shfl_sync_mask, vec_start
+                    );
+                    break;
+                case 1:
+                    compute_grad_sum_{{ kdesc }}_unroll<grad_t,cache_t,kFixedMaxVecsPerThread,kThreadGroupSize,VEC_WIDTH,1>(
+                        grad_sum, grad_output, 
+                        {%- if not nobag or is_index_select %}
+                        D_offsets,
+                        {%- endif %}
+                        D, T, sorted_infos,
+                        {%- if weighted %}
+                        sorted_indice_weights,
+                        {%- endif %}
+                        {%- if not nobag and vbe %}
+                        B_offsets,
+                        row_output_offsets,
+                        {%- endif %}
+                        {%- if is_index_select %}
+                        grad_offset,
+                        grad_stride,
+                        {%- endif %}
+                        {%- if not nobag %} 
+                        info_B_num_bits, info_B_mask,
+                        {%- endif %}
+                        segment_start, sl_start, sl_end, shfl_sync_mask, vec_start
+                    );
+                    break;
+            }
+        };
+
+        for (int i = 0; i < num_factors; ++i) {
+            call_unroll(unroll_factors[i], start[i], end[i]);
+        }
+       
+        call_unroll(1, end[num_factors-1], sl_end);
+
         {%- set d_vec = "((vec + vec_start) * kThreadGroupSize + threadIdx.x)" %}
 
         if (smem_grad_sum) {
